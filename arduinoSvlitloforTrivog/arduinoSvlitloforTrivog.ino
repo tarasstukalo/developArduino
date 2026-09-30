@@ -4,110 +4,123 @@
 
 HWCDC USBSerial;
 
-// ================= WI-FI =================
-
+// =========================
+// Wi-Fi
+// =========================
 const char* ssid = "Home Protsak";
 const char* password = "Wednesday";
 
+// =========================
+// NEPTUN
+// =========================
 const char* host = "neptun.in.ua";
 const int port = 443;
 
-
-// ================= LED =================
-
-// Вбудований LED на ESP32-C3 Super Mini
+// =========================
+// LED
+// =========================
 const int LED_PIN = 8;
 
-
-// ================= СТАТУСИ =================
-
-enum AlertStatus {
-  STATUS_GREEN,    // Відбій
-  STATUS_UAV,      // БПЛА
-  STATUS_MISSILE   // Ракета
-};
-
-AlertStatus currentStatus = STATUS_GREEN;
-
-
-// ================= ТАЙМЕРИ =================
-
+// Перевірка кожні 5 секунд
 unsigned long lastCheck = 0;
 const unsigned long checkInterval = 5000;
 
-unsigned long lastBlink = 0;
-bool ledState = false;
 
+// ========================================
+// Читаємо chunked-відповідь
+// ========================================
+String readChunkedResponse(WiFiClientSecure &client) {
 
-// ================= LED =================
+  String body = "";
 
-void updateLed() {
+  while (true) {
 
-  // 🔴 РАКЕТНА ЗАГРОЗА
-  if (currentStatus == STATUS_MISSILE) {
+    // Читаємо розмір наступного chunk
+    String sizeLine = client.readStringUntil('\n');
+    sizeLine.trim();
 
-    digitalWrite(LED_PIN, HIGH);
-    return;
-  }
-
-
-  // 🟢 ВІДБІЙ
-  if (currentStatus == STATUS_GREEN) {
-
-    digitalWrite(LED_PIN, LOW);
-    ledState = false;
-    return;
-  }
-
-
-  // 🟠 БПЛА — блимає кожну секунду
-  if (currentStatus == STATUS_UAV) {
-
-    if (millis() - lastBlink >= 1000) {
-
-      lastBlink = millis();
-
-      ledState = !ledState;
-
-      digitalWrite(LED_PIN, ledState);
+    if (sizeLine.length() == 0) {
+      continue;
     }
+
+    // Розмір у hex
+    int chunkSize = strtol(sizeLine.c_str(), NULL, 16);
+
+    // Кінець відповіді
+    if (chunkSize == 0) {
+      break;
+    }
+
+    // Читаємо chunk
+    int remaining = chunkSize;
+
+    while (remaining > 0) {
+
+      while (!client.available()) {
+        delay(1);
+      }
+
+      int availableBytes = client.available();
+
+      int toRead = min(availableBytes, remaining);
+
+      char buffer[256];
+
+      if (toRead > 255) {
+        toRead = 255;
+      }
+
+      int readBytes = client.readBytes(buffer, toRead);
+
+      if (readBytes > 0) {
+        body.concat(buffer, readBytes);
+        remaining -= readBytes;
+      }
+    }
+
+    // Після кожного chunk є CRLF
+    client.readStringUntil('\n');
   }
+
+  return body;
 }
 
 
-// ================= HTTP ЗАПИТ =================
-
-String makeGetRequest(const char* path) {
+// ========================================
+// Отримання JSON з NEPTUN
+// ========================================
+String getAlerts() {
 
   WiFiClientSecure client;
 
   client.setInsecure();
+  client.setTimeout(5000);
 
-  USBSerial.print("Запит: ");
-  USBSerial.println(path);
+  USBSerial.println("Отримання даних...");
 
   if (!client.connect(host, port)) {
 
-    USBSerial.println("Помилка підключення до NEPTUN!");
+    USBSerial.println("❌ Помилка підключення до NEPTUN");
 
     return "";
   }
 
+  client.println("GET /api/v1/alerts HTTP/1.1");
+  client.println("Host: neptun.in.ua");
+  client.println("User-Agent: ESP32-C3");
+  client.println("Accept: application/json");
+  client.println("Connection: close");
+  client.println();
 
-  client.printf("GET %s HTTP/1.1\r\n", path);
-  client.printf("Host: %s\r\n", host);
-  client.printf("User-Agent: ESP32-C3-AlertMonitor\r\n");
-  client.printf("Accept: application/json\r\n");
-  client.printf("Connection: close\r\n\r\n");
 
+  // Чекаємо відповідь
+  unsigned long start = millis();
 
-  unsigned long timeout = millis();
+  while (!client.available()) {
 
-  while (client.connected() && !client.available()) {
+    if (millis() - start > 5000) {
 
-    if (millis() - timeout > 5000) {
-
-      USBSerial.println("Timeout!");
+      USBSerial.println("❌ Timeout");
 
       client.stop();
 
@@ -118,119 +131,272 @@ String makeGetRequest(const char* path) {
   }
 
 
-  String response = "";
+  // ========================================
+  // Читаємо HTTP-заголовки
+  // ========================================
 
-  while (client.available()) {
+  bool chunked = false;
 
-    response += client.readString();
+  while (true) {
+
+    String line = client.readStringUntil('\n');
+
+    line.trim();
+
+    if (line.length() == 0) {
+      break;
+    }
+
+    if (line.indexOf("Transfer-Encoding: chunked") >= 0 ||
+        line.indexOf("transfer-encoding: chunked") >= 0) {
+
+      chunked = true;
+    }
   }
+
+
+  String body = "";
+
+
+  // ========================================
+  // Якщо chunked
+  // ========================================
+
+  if (chunked) {
+
+    body = readChunkedResponse(client);
+
+  }
+
+  // ========================================
+  // Якщо звичайна відповідь
+  // ========================================
+
+  else {
+
+    while (client.available()) {
+      body += client.readString();
+    }
+  }
+
 
   client.stop();
 
-
-  return response;
+  return body;
 }
 
 
-// ================= ПЕРЕВІРКА ТРИВОГ =================
+// ========================================
+// Перевірка Києва
+// ========================================
+bool checkKyivAlert(String json) {
 
-void checkAlerts() {
+  const char* targetKey = "\"key\":\"м. київ\"";
 
-  if (WiFi.status() != WL_CONNECTED) {
+  int keyPos = json.indexOf(targetKey);
 
-    USBSerial.println("Wi-Fi відключено!");
 
-    return;
+  // Київ не знайдено
+  if (keyPos < 0) {
+
+    USBSerial.println("⚠️ Київ у JSON не знайдено!");
+
+    return false;
   }
 
 
-  USBSerial.println();
-  USBSerial.println("=================================");
-  USBSerial.println("Перевірка загроз...");
+  USBSerial.println("✅ Київ знайдено в JSON");
 
 
-  // Отримуємо активні загрози
+  // Знаходимо об'єкт Києва
+  int objectStart = json.lastIndexOf('{', keyPos);
+  int objectEnd = json.indexOf('}', keyPos);
 
-  String threatsJson = makeGetRequest("/api/v1/threats");
 
+  if (objectStart < 0 || objectEnd < 0) {
 
-  if (threatsJson.length() == 0) {
+    USBSerial.println("❌ Помилка читання об'єкта Києва");
 
-    USBSerial.println("Не отримано дані!");
-
-    return;
+    return false;
   }
 
 
-  // Переводимо все в нижній регістр
-
-  threatsJson.toLowerCase();
-
-
-  // ================= РАКЕТИ =================
-
-  bool missileThreat =
-
-      threatsJson.indexOf("\"missile\"") != -1 ||
-
-      threatsJson.indexOf("\"ballistic\"") != -1;
+  String kyivObject = json.substring(
+    objectStart,
+    objectEnd + 1
+  );
 
 
-  // ================= БПЛА =================
-
-  bool uavThreat =
-
-      threatsJson.indexOf("\"uav\"") != -1 ||
-
-      threatsJson.indexOf("\"drone\"") != -1;
+  // Шукаємо level
+  int levelPos = kyivObject.indexOf("\"level\":\"");
 
 
-  // ================= ВИЗНАЧЕННЯ СТАТУСУ =================
+  if (levelPos < 0) {
 
-  if (missileThreat) {
+    USBSerial.println("⚠️ Level Києва не знайдено");
 
-    currentStatus = STATUS_MISSILE;
-
-  }
-
-  else if (uavThreat) {
-
-    currentStatus = STATUS_UAV;
-
-  }
-
-  else {
-
-    currentStatus = STATUS_GREEN;
+    return false;
   }
 
 
-  // ================= SERIAL MONITOR =================
+  int valueStart = levelPos + 9;
 
-  if (currentStatus == STATUS_MISSILE) {
+  int valueEnd = kyivObject.indexOf(
+    '"',
+    valueStart
+  );
 
-    USBSerial.println("🔴 СТАТУС: РАКЕТНА ЗАГРОЗА");
 
-  }
+  if (valueEnd < 0) {
 
-  else if (currentStatus == STATUS_UAV) {
+    USBSerial.println("❌ Помилка читання level");
 
-    USBSerial.println("🟠 СТАТУС: ЗАГРОЗА БПЛА");
-
-  }
-
-  else {
-
-    USBSerial.println("🟢 СТАТУС: ВІДБІЙ / НЕМАЄ ТРИВОГИ");
+    return false;
   }
 
 
-  USBSerial.println("=================================");
+  String level = kyivObject.substring(
+    valueStart,
+    valueEnd
+  );
+
+
+  USBSerial.print("Рівень Києва: ");
+  USBSerial.println(level);
+
+
+  // yellow або red = тривога
+  if (level == "yellow" || level == "red") {
+
+    return true;
+  }
+
+
+  return false;
 }
 
 
-// ================= SETUP =================
+// ========================================
+// Перевірка тривоги
+// ========================================
+void checkAlert() {
 
+  String json = getAlerts();
+
+  if (json.length() == 0) {
+    return;
+  }
+
+  bool alert = false;
+
+  // ========================================
+  // Перевіряємо райони Київської області
+  // ========================================
+
+  int searchPos = 0;
+
+  while (true) {
+
+    // Шукаємо "oblast":"Київська область"
+    int oblastPos = json.indexOf(
+      "\"oblast\":\"Київська область\"",
+      searchPos
+    );
+
+    if (oblastPos < 0) {
+      break;
+    }
+
+    // Знаходимо початок об'єкта району
+    int objectStart = json.lastIndexOf('{', oblastPos);
+
+    // Знаходимо кінець об'єкта
+    int objectEnd = json.indexOf('}', oblastPos);
+
+    if (objectStart >= 0 && objectEnd > oblastPos) {
+
+      String object = json.substring(
+        objectStart,
+        objectEnd + 1
+      );
+
+      // Назва району
+      int namePos = object.indexOf("\"name\":\"");
+
+      if (namePos >= 0) {
+
+        int nameStart = namePos + 8;
+        int nameEnd = object.indexOf('"', nameStart);
+
+        if (nameEnd > nameStart) {
+
+          String name = object.substring(
+            nameStart,
+            nameEnd
+          );
+
+          USBSerial.print("Район Київської області: ");
+          USBSerial.println(name);
+        }
+      }
+
+      // Рівень
+      int levelPos = object.indexOf("\"level\":\"");
+
+      if (levelPos >= 0) {
+
+        int levelStart = levelPos + 9;
+        int levelEnd = object.indexOf('"', levelStart);
+
+        if (levelEnd > levelStart) {
+
+          String level = object.substring(
+            levelStart,
+            levelEnd
+          );
+
+          USBSerial.print("Рівень: ");
+          USBSerial.println(level);
+
+          // yellow або red = активна тривога
+          if (level == "yellow" || level == "red") {
+
+            alert = true;
+          }
+        }
+      }
+    }
+
+    searchPos = objectEnd + 1;
+  }
+
+
+  // ========================================
+  // LED
+  // ========================================
+
+  if (alert) {
+
+    // LOW = LED світиться
+    digitalWrite(LED_PIN, LOW);
+
+    USBSerial.println("🔴 КИЇВСЬКА ОБЛАСТЬ — ТРИВОГА Є");
+    USBSerial.println("LED: ON");
+
+  } else {
+
+    // HIGH = LED вимкнений
+    digitalWrite(LED_PIN, HIGH);
+
+    USBSerial.println("🟢 КИЇВСЬКА ОБЛАСТЬ — ТРИВОГИ НЕМАЄ");
+    USBSerial.println("LED: OFF");
+  }
+
+  USBSerial.println("-----------------------------");
+}
+// ========================================
+// SETUP
+// ========================================
 void setup() {
 
   USBSerial.begin(115200);
@@ -239,19 +405,24 @@ void setup() {
 
 
   // LED
-
   pinMode(LED_PIN, OUTPUT);
 
-  digitalWrite(LED_PIN, LOW);
+  // Вимкнути LED
+  digitalWrite(LED_PIN, HIGH);
 
 
-  // ================= WI-FI =================
-
+  // Wi-Fi
   WiFi.setSleep(false);
 
   WiFi.mode(WIFI_STA);
 
   WiFi.begin(ssid, password);
+
+
+  USBSerial.println();
+  USBSerial.println("=============================");
+  USBSerial.println(" ESP32-C3 NEPTUN ALERT");
+  USBSerial.println("=============================");
 
 
   USBSerial.print("Підключення до Wi-Fi");
@@ -267,41 +438,30 @@ void setup() {
 
   USBSerial.println();
 
-  USBSerial.println("Wi-Fi успішно підключено!");
+  USBSerial.println("✅ Wi-Fi підключено!");
 
-  USBSerial.print("IP адреса: ");
-
+  USBSerial.print("IP: ");
   USBSerial.println(WiFi.localIP());
 
-
-  // Початковий стан — відбій
-
-  currentStatus = STATUS_GREEN;
-
-  updateLed();
+  USBSerial.println();
 
 
   // Перша перевірка
+  checkAlert();
 
-  checkAlerts();
+  lastCheck = millis();
 }
 
 
-// ================= LOOP =================
-
+// ========================================
+// LOOP 
+// ========================================
 void loop() {
-
-  // Оновлюємо LED постійно
-
-  updateLed();
-
-
-  // Перевіряємо API кожні 5 секунд
 
   if (millis() - lastCheck >= checkInterval) {
 
     lastCheck = millis();
 
-    checkAlerts();
+    checkAlert();
   }
 }
